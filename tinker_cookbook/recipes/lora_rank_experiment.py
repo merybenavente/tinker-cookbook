@@ -65,6 +65,11 @@ class LoRARankConfig:
     output_dir: str = "./lora_rank_results"
     checkpoint_dir: str = "./lora_rank_checkpoints"
 
+    # Inference benchmarking configuration
+    num_inference_samples: int = 10  # Number of prompts to test
+    inference_max_tokens: int = 50   # Tokens to generate per prompt
+    inference_temperature: float = 0.7
+
     # Tinker service
     tinker_url: str = "http://localhost:8000"
 
@@ -241,6 +246,103 @@ def train_single_rank(
     return metrics_dict, training_client
 
 
+def benchmark_inference(
+    training_client: tinker.TrainingClient,
+    tokenizer,
+    renderer: renderers.Renderer,
+    config: LoRARankConfig,
+) -> dict:
+    """
+    Benchmark inference latency for the trained model.
+
+    Creates a sampling client from the training client and measures
+    generation speed on test prompts.
+
+    Args:
+        training_client: Tinker training client with trained model weights
+        tokenizer: Tokenizer for the model
+        renderer: Renderer for formatting prompts
+        config: Experiment configuration
+
+    Returns:
+        Dictionary with inference metrics (latency, tokens/sec)
+    """
+    logger.info("Benchmarking inference performance...")
+
+    # Create sampling client from trained model
+    sampling_client = training_client.save_weights_and_get_sampling_client(
+        name="inference_benchmark"
+    )
+
+    # Test prompts (diverse set from Alpaca-style instructions)
+    test_prompts = [
+        "Explain the concept of machine learning in simple terms.",
+        "Write a Python function to calculate the factorial of a number.",
+        "What are the main causes of climate change?",
+        "Describe the process of photosynthesis.",
+        "How do you make a good first impression in a job interview?",
+        "What is the difference between RAM and ROM?",
+        "Explain the theory of relativity.",
+        "Write a short poem about the ocean.",
+        "What are the benefits of regular exercise?",
+        "How does the internet work?",
+    ]
+
+    # Use only the requested number of samples
+    test_prompts = test_prompts[:config.num_inference_samples]
+
+    # Configure sampling parameters
+    sampling_params = tinker.SamplingParams(
+        max_tokens=config.inference_max_tokens,
+        temperature=config.inference_temperature,
+        stop=renderer.get_stop_sequences(),
+    )
+
+    latencies = []
+    total_tokens_generated = 0
+
+    for i, prompt in enumerate(test_prompts):
+        # Tokenize prompt
+        tokenized_prompt = tinker.ModelInput.from_ints(tokenizer.encode(prompt))
+
+        # Measure generation time
+        start_time = time.time()
+        future = sampling_client.sample(
+            prompt=tokenized_prompt,
+            sampling_params=sampling_params,
+            num_samples=1,
+        )
+        result = future.result()
+        latency = time.time() - start_time
+
+        # Count generated tokens
+        num_tokens = len(result.sequences[0].tokens)
+        total_tokens_generated += num_tokens
+        latencies.append(latency)
+
+        if i == 0:
+            # Log first example
+            response = tokenizer.decode(result.sequences[0].tokens)
+            logger.info(f"Sample generation:\n  Prompt: {prompt[:50]}...\n  Response: {response[:100]}...")
+
+    # Calculate metrics
+    avg_latency = sum(latencies) / len(latencies)
+    total_time = sum(latencies)
+    tokens_per_sec = total_tokens_generated / total_time if total_time > 0 else 0
+
+    logger.info(f"Inference benchmark complete:")
+    logger.info(f"  Avg latency: {avg_latency:.3f}s per prompt")
+    logger.info(f"  Tokens/sec: {tokens_per_sec:.1f}")
+    logger.info(f"  Total tokens generated: {total_tokens_generated}")
+
+    return {
+        "avg_latency_seconds": avg_latency,
+        "tokens_per_sec": tokens_per_sec,
+        "total_tokens_generated": total_tokens_generated,
+        "num_prompts": len(test_prompts),
+    }
+
+
 def evaluate_model(
     training_client: tinker.TrainingClient,
     val_conversations: list[dict],
@@ -363,6 +465,14 @@ def main(config: LoRARankConfig):
             config=config,
         )
 
+        # Benchmark inference latency
+        inference_results = benchmark_inference(
+            training_client=training_client,
+            tokenizer=tokenizer,
+            renderer=renderer,
+            config=config,
+        )
+
         rank_total_time = time.time() - rank_start_time
 
         # Combine results
@@ -374,6 +484,7 @@ def main(config: LoRARankConfig):
                 "metrics_history": train_results["metrics_history"],
             },
             "evaluation": eval_results,
+            "inference": inference_results,
             "total_time_seconds": rank_total_time,
         }
 
@@ -384,7 +495,9 @@ def main(config: LoRARankConfig):
         logger.info(f"  Training Loss: {train_results['final_loss']:.4f}")
         logger.info(f"  Validation Loss: {eval_results['val_loss']:.4f}")
         logger.info(f"  Perplexity: {eval_results['perplexity']:.2f}")
-        logger.info(f"  Avg Tokens/sec: {train_results['avg_tokens_per_sec']:.1f}")
+        logger.info(f"  Training Tokens/sec: {train_results['avg_tokens_per_sec']:.1f}")
+        logger.info(f"  Inference Tokens/sec: {inference_results['tokens_per_sec']:.1f}")
+        logger.info(f"  Inference Latency: {inference_results['avg_latency_seconds']:.3f}s")
         logger.info(f"  Total Time: {rank_total_time:.1f}s")
         logger.info(f"{'='*70}")
 
@@ -400,19 +513,24 @@ def main(config: LoRARankConfig):
 
     # Print summary table
     logger.info("\nSUMMARY:")
-    logger.info("-" * 70)
-    logger.info(f"{'Rank':<10} {'Train Loss':<15} {'Val Loss':<15} {'Perplexity':<15} {'Tokens/s':<15}")
-    logger.info("-" * 70)
+    logger.info("-" * 95)
+    logger.info(
+        f"{'Rank':<8} {'Train Loss':<12} {'Val Loss':<12} {'Perplexity':<12} "
+        f"{'Train tok/s':<12} {'Infer tok/s':<12} {'Infer Lat':<12}"
+    )
+    logger.info("-" * 95)
     for rank in config.ranks_to_test:
         result = all_results[f"rank_{rank}"]
         logger.info(
-            f"{rank:<10} "
-            f"{result['training']['final_loss']:<15.4f} "
-            f"{result['evaluation']['val_loss']:<15.4f} "
-            f"{result['evaluation']['perplexity']:<15.2f} "
-            f"{result['training']['avg_tokens_per_sec']:<15.1f}"
+            f"{rank:<8} "
+            f"{result['training']['final_loss']:<12.4f} "
+            f"{result['evaluation']['val_loss']:<12.4f} "
+            f"{result['evaluation']['perplexity']:<12.2f} "
+            f"{result['training']['avg_tokens_per_sec']:<12.1f} "
+            f"{result['inference']['tokens_per_sec']:<12.1f} "
+            f"{result['inference']['avg_latency_seconds']:<12.3f}"
         )
-    logger.info("-" * 70)
+    logger.info("-" * 95)
 
 
 if __name__ == "__main__":
