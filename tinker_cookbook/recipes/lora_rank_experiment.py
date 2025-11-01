@@ -10,6 +10,7 @@ and measures:
 """
 
 import logging
+import math
 import random
 import time
 from dataclasses import dataclass, field
@@ -228,4 +229,59 @@ def train_single_rank(
         "metrics_history": metrics_history,
         "final_loss": metrics_history[-1]["train_loss"],
         "avg_tokens_per_sec": sum(m["tokens_per_sec"] for m in metrics_history) / len(metrics_history),
+    }
+
+
+def evaluate_model(
+    training_client: tinker.TrainingClient,
+    val_conversations: list[dict],
+    renderer: renderers.Renderer,
+    config: LoRARankConfig,
+) -> dict:
+    """
+    Evaluate model on validation data.
+
+    This does forward passes (no gradient computation) on the validation set
+    to compute validation loss and perplexity.
+
+    Args:
+        training_client: Tinker training client with current model weights
+        val_conversations: List of validation conversations
+        renderer: Renderer for converting conversations to model format
+        config: Experiment configuration
+
+    Returns:
+        Dictionary with evaluation metrics (val_loss, perplexity)
+    """
+    logger.info("Running evaluation on validation set...")
+
+    # Convert all validation conversations to Datum format
+    val_data = [
+        conversation_to_datum(
+            conversation,
+            renderer,
+            config.max_length,
+            renderers.TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+        )
+        for conversation in val_conversations
+    ]
+
+    # Forward pass only (no backward, no optimizer step)
+    # This computes loss without updating weights
+    future = training_client.forward(val_data, loss_fn="cross_entropy")
+    result = future.result()
+
+    # Extract logprobs and compute NLL
+    logprobs = [x["logprobs"] for x in result.loss_fn_outputs]
+    weights = [datum.loss_fn_inputs["weights"] for datum in val_data]
+    val_nll = compute_mean_nll(logprobs, weights)
+
+    # Perplexity is exp(NLL)
+    perplexity = math.exp(val_nll)
+
+    logger.info(f"Validation NLL: {val_nll:.4f} | Perplexity: {perplexity:.2f}")
+
+    return {
+        "val_loss": val_nll,
+        "perplexity": perplexity,
     }
