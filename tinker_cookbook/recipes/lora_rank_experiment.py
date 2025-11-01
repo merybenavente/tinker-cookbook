@@ -9,11 +9,13 @@ and measures:
 - Training stability (loss variance)
 """
 
+import json
 import logging
 import math
 import random
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import chz
 import tinker
@@ -25,6 +27,10 @@ from tinker_cookbook.supervised.data import conversation_to_datum
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 
 @chz.chz
@@ -116,7 +122,7 @@ def train_single_rank(
     train_conversations: list[dict],
     config: LoRARankConfig,
     service_client: tinker.ServiceClient,
-) -> dict:
+) -> tuple[dict, tinker.TrainingClient]:
     """
     Train a model with a specific LoRA rank.
 
@@ -127,7 +133,8 @@ def train_single_rank(
         service_client: Tinker service client
 
     Returns:
-        Dictionary with training metrics history
+        Tuple of (metrics_dict, training_client) where metrics_dict contains training history
+        and training_client has the trained model weights
     """
     logger.info(f"\n{'='*60}")
     logger.info(f"Training with LoRA rank: {rank}")
@@ -224,12 +231,14 @@ def train_single_rank(
 
     logger.info(f"Training completed for rank {rank}")
 
-    return {
+    metrics_dict = {
         "rank": rank,
         "metrics_history": metrics_history,
         "final_loss": metrics_history[-1]["train_loss"],
         "avg_tokens_per_sec": sum(m["tokens_per_sec"] for m in metrics_history) / len(metrics_history),
     }
+
+    return metrics_dict, training_client
 
 
 def evaluate_model(
@@ -285,3 +294,126 @@ def evaluate_model(
         "val_loss": val_nll,
         "perplexity": perplexity,
     }
+
+
+def main(config: LoRARankConfig):
+    """
+    Main experiment runner: trains and evaluates models with different LoRA ranks.
+
+    For each rank in config.ranks_to_test:
+    1. Train the model
+    2. Evaluate on validation set
+    3. Collect metrics
+    4. Save results
+
+    Args:
+        config: Experiment configuration
+    """
+    logger.info("="*70)
+    logger.info("LoRA Rank Experiment Starting")
+    logger.info("="*70)
+    logger.info(f"Model: {config.model_name}")
+    logger.info(f"Ranks to test: {config.ranks_to_test}")
+    logger.info(f"Training steps: {config.num_training_steps}")
+    logger.info(f"Batch size: {config.batch_size}")
+    logger.info(f"Learning rate: {config.learning_rate}")
+    logger.info("="*70)
+
+    # Create output directory
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Setup Tinker service client
+    service_client = tinker.ServiceClient(base_url=config.tinker_url)
+    logger.info(f"Connected to Tinker service at {config.tinker_url}")
+
+    # Load and prepare dataset
+    logger.info("\nLoading dataset...")
+    train_conversations, val_conversations = prepare_alpaca_dataset(config)
+
+    # Setup tokenizer and renderer (shared across all ranks)
+    tokenizer = get_tokenizer(config.model_name)
+    renderer_name = model_info.get_recommended_renderer_name(config.model_name)
+    renderer = renderers.get_renderer(renderer_name, tokenizer)
+
+    # Storage for all results
+    all_results = {}
+
+    # Train and evaluate each rank
+    for rank in config.ranks_to_test:
+        logger.info(f"\n{'='*70}")
+        logger.info(f"STARTING RANK {rank}")
+        logger.info(f"{'='*70}")
+
+        rank_start_time = time.time()
+
+        # Train the model with this rank
+        train_results, training_client = train_single_rank(
+            rank=rank,
+            train_conversations=train_conversations,
+            config=config,
+            service_client=service_client,
+        )
+
+        # Evaluate on validation set with the trained model
+        eval_results = evaluate_model(
+            training_client=training_client,
+            val_conversations=val_conversations,
+            renderer=renderer,
+            config=config,
+        )
+
+        rank_total_time = time.time() - rank_start_time
+
+        # Combine results
+        rank_results = {
+            "rank": rank,
+            "training": {
+                "final_loss": train_results["final_loss"],
+                "avg_tokens_per_sec": train_results["avg_tokens_per_sec"],
+                "metrics_history": train_results["metrics_history"],
+            },
+            "evaluation": eval_results,
+            "total_time_seconds": rank_total_time,
+        }
+
+        all_results[f"rank_{rank}"] = rank_results
+
+        logger.info(f"\n{'='*70}")
+        logger.info(f"RANK {rank} COMPLETED")
+        logger.info(f"  Training Loss: {train_results['final_loss']:.4f}")
+        logger.info(f"  Validation Loss: {eval_results['val_loss']:.4f}")
+        logger.info(f"  Perplexity: {eval_results['perplexity']:.2f}")
+        logger.info(f"  Avg Tokens/sec: {train_results['avg_tokens_per_sec']:.1f}")
+        logger.info(f"  Total Time: {rank_total_time:.1f}s")
+        logger.info(f"{'='*70}")
+
+    # Save results to JSON
+    results_file = output_dir / "experiment_results.json"
+    with open(results_file, "w") as f:
+        json.dump(all_results, f, indent=2)
+
+    logger.info(f"\n{'='*70}")
+    logger.info("EXPERIMENT COMPLETED")
+    logger.info(f"Results saved to: {results_file}")
+    logger.info(f"{'='*70}")
+
+    # Print summary table
+    logger.info("\nSUMMARY:")
+    logger.info("-" * 70)
+    logger.info(f"{'Rank':<10} {'Train Loss':<15} {'Val Loss':<15} {'Perplexity':<15} {'Tokens/s':<15}")
+    logger.info("-" * 70)
+    for rank in config.ranks_to_test:
+        result = all_results[f"rank_{rank}"]
+        logger.info(
+            f"{rank:<10} "
+            f"{result['training']['final_loss']:<15.4f} "
+            f"{result['evaluation']['val_loss']:<15.4f} "
+            f"{result['evaluation']['perplexity']:<15.2f} "
+            f"{result['training']['avg_tokens_per_sec']:<15.1f}"
+        )
+    logger.info("-" * 70)
+
+
+if __name__ == "__main__":
+    chz.nested_entrypoint(main)
