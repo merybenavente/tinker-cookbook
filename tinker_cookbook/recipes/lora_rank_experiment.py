@@ -14,7 +14,6 @@ import logging
 import math
 import random
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import chz
@@ -34,15 +33,14 @@ logging.basicConfig(
 
 
 @chz.chz
-@dataclass
 class LoRARankConfig:
     """Configuration for LoRA rank experiment"""
 
     # Model configuration
-    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
 
     # LoRA ranks to test
-    ranks_to_test: list[int] = field(default_factory=lambda: [2, 4, 8, 16, 32])
+    ranks_to_test: list[int] = chz.field(default_factory=lambda: [2, 4, 8, 16, 32])
 
     # Training hyperparameters (constant across all ranks)
     learning_rate: float = 1e-4
@@ -70,8 +68,7 @@ class LoRARankConfig:
     inference_max_tokens: int = 50   # Tokens to generate per prompt
     inference_temperature: float = 0.7
 
-    # Tinker service
-    tinker_url: str = "http://localhost:8000"
+
 
 
 def prepare_alpaca_dataset(config: LoRARankConfig) -> tuple[list[dict], list[dict]]:
@@ -426,8 +423,8 @@ def main(config: LoRARankConfig):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Setup Tinker service client
-    service_client = tinker.ServiceClient(base_url=config.tinker_url)
-    logger.info(f"Connected to Tinker service at {config.tinker_url}")
+    service_client = tinker.ServiceClient()
+    logger.info(f"Connected to Tinker service")
 
     # Load and prepare dataset
     logger.info("\nLoading dataset...")
@@ -520,7 +517,11 @@ def main(config: LoRARankConfig):
     )
     logger.info("-" * 95)
     for rank in config.ranks_to_test:
-        result = all_results[f"rank_{rank}"]
+        rank_key = f"rank_{rank}"
+        if rank_key not in all_results:
+            logger.info(f"{rank:<8} {'FAILED - No results available'}")
+            continue
+        result = all_results[rank_key]
         logger.info(
             f"{rank:<8} "
             f"{result['training']['final_loss']:<12.4f} "
